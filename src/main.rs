@@ -1,4 +1,4 @@
-use std::ops::Neg;
+use std::ptr;
 use sdl2;
 use glm;
 use gl;
@@ -6,12 +6,21 @@ use imgui;
 use imgui::Condition;
 use imgui_sdl2;
 use imgui_opengl_renderer;
+use rand;
+use rand::{Rng};
+use sdl2::mouse::MouseButton;
+use crate::ogl::Buffer;
+
+static EPS: f32 = 16.0;
+
 mod ogl;
 #[derive(Copy)]
 pub struct Particle{
     pub position: glm::Vec2,
     pub velocity: glm::Vec2,
     pub forces: glm::Vec2,
+    pub press_force: glm::Vec2,
+    pub visc_force: glm::Vec2,
     pub pressure: f32,
     pub rho: f32
 }
@@ -22,140 +31,82 @@ impl Clone for Particle {
             position: self.position,
             velocity: self.velocity,
             forces: self.forces,
+            press_force: self.press_force,
+            visc_force: self.visc_force,
             pressure: self.pressure,
             rho: self.rho,
         }
     }
 }
 
-static G: glm::Vec2 = glm::Vector2{
-    x: 0.0,
-    y: -10.0,
-};
 
-const PIXEL_SIZE: i32 = 8;
-const PIXEL_MIN: i32 = -(PIXEL_SIZE / 2);
-const PIXEL_MAX: i32 = PIXEL_SIZE / 2;
-static REST_DENS: f32 = 300.0;
-static mut GAS_CONST: f32 = 2000.0; // default 2000
-static KERNEL_RADIUS: f32 = 16.0;
-static KR_SQ: f32 = KERNEL_RADIUS * KERNEL_RADIUS;
-static MASS: f32 = 2.5;
-static VISC: f32 = 100.0;
-static EPS: f32 = KERNEL_RADIUS;
-static BOUND_DAMPING: f32 = -0.2;
+pub struct PARAMS{
+    pub pixel_size: i32,
+    pub rest_dens: f32,
+    pub gas_const: f32,
+    pub kernel_radius: f32,
+    pub kr_sq: f32,
+    pub mass: f32,
+    pub visc: f32,
+    pub eps: f32,
+    pub bound_damping: f32
 
-fn POLY6() -> f32{
-    4.0 / (std::f32::consts::PI * KERNEL_RADIUS.powf(8.0))
 }
 
-fn SPIKY_GRAD() -> f32{
-    -10.0 / (std::f32::consts::PI * KERNEL_RADIUS.powf(5.0))
-}
-
-fn VISC_LAP() -> f32{
-    40.0 / (std::f32::consts::PI * KERNEL_RADIUS.powf(5.0))
-}
-
-fn compute_density(particles: &mut [Particle], num_particles: usize){
-    for pi in 0..num_particles{
-        particles[pi].rho = 0.0;
-        for pj in 0..num_particles{
-            let rij = particles[pj].position - particles[pi].position;
-            let r2 = glm::pow(rij.x, 2.0) + glm::pow(rij.y, 2.0);
-            if r2 < KR_SQ{
-                particles[pi].rho += MASS * POLY6() * (KR_SQ - r2).powf(3.0);
-            }
-        }
-        unsafe { particles[pi].pressure = GAS_CONST * (particles[pi].rho - REST_DENS); }
-    }
-}
-
-fn compute_forces(particles: &mut [Particle], num_particles: usize){
-    for pi in 0..num_particles{
-        let mut pressure_force = glm::Vec2::new(0.0, 0.0);
-        let mut viscosity_force = glm::Vec2::new(0.0, 0.0);
-        for pj in 0..num_particles{
-            if pi == pj{
-                continue;
-            }
-
-            let rij = particles[pj].position - particles[pi].position;
-            let r = glm::sqrt(glm::pow(rij.x, 2.0) + glm::pow(rij.y, 2.0));
-
-            if r < KERNEL_RADIUS{
-                pressure_force = pressure_force + (glm::normalize(rij.neg()) * MASS * (particles[pi].pressure + particles[pj].pressure) / (2.0 * particles[pj].rho) * SPIKY_GRAD() * (KERNEL_RADIUS - r).powf(3.0));
-
-                viscosity_force = viscosity_force + (glm::to_vec2(VISC * MASS) * (particles[pj].velocity - particles[pi].velocity) / particles[pj].rho * VISC_LAP() * (KERNEL_RADIUS - r));
-
-            }
-        }
-        particles[pi].forces = pressure_force + viscosity_force + (G * MASS / particles[pi].rho);
-    }
-}
-
-fn update_velocity_position(particles: &mut [Particle], num_particles: usize, delta_time: f32){
-    for pi in 0..num_particles{
-        particles[pi].velocity = particles[pi].velocity + (glm::to_vec2(delta_time) * particles[pi].forces / particles[pi].rho);
-        particles[pi].position = particles[pi].position + (particles[pi].velocity * delta_time);
-        let particle = &mut particles[pi];
-
-        if particle.position.x - EPS < 0.0{
-            particle.velocity.x *= BOUND_DAMPING;
-            particle.position.x = EPS;
-        }
-        if particle.position.x + EPS > 800.0{
-            particle.velocity.x *= BOUND_DAMPING;
-            particle.position.x = 800.0 - EPS;
-        }
-
-        if particle.position.y - EPS < 0.0{
-            particle.velocity.y *= BOUND_DAMPING;
-            particle.position.y = EPS;
-        }
-        if particle.position.y + EPS > 600.0{
-            particle.velocity.y *= BOUND_DAMPING;
-            particle.position.y = 600.0 - EPS;
-        }
-    }
-}
 fn main() {
-    let mut particles: [Particle; 1000] = [Particle{
+    let mut pause = false;
+    let mut parameters = PARAMS{
+        pixel_size: 10,
+        rest_dens: 300.0,
+        gas_const: 2000.0,
+        kernel_radius: 16.0,
+        kr_sq: (16.0_f32.powf(2.0)),
+        mass: 2.5,
+        visc: 200.0,
+        eps: 16.0,
+        bound_damping: -0.5,
+    };
+    let mut rand_thread = rand::thread_rng();
+    let mut particles: [Particle; 10000] = [Particle{
         position: glm::vec2(0.0, 0.0),
         velocity: glm::vec2(0.0, 0.0),
         forces: glm::vec2(0.0, 0.0),
+        press_force: glm::vec2(0.0, 0.0),
+        visc_force: glm::vec2(0.0, 0.0),
         pressure: 0.0,
         rho: 0.0,
-    }; 1000];
-    let mut num_particles: usize = 400;
-    for x in 0..400{
-        particles[x] = Particle{
-            position: glm::vec2(10.0 * x as f32, 2.0 * x as f32),
-            velocity: glm::vec2(0.0, 0.0),
-            forces: glm::vec2(0.0, 0.0),
-            pressure: 0.0,
-            rho: 0.0,
-        };
+    }; 10000];
+    let mut num_particles: usize = 00;
+    let mut num_placed = 0;
+    for y in 1..(900/EPS as i32){
+        for x in 1..((1600/2)/EPS as i32){
+            if num_placed < num_particles {
+                particles[num_placed] = Particle {
+                    position: glm::vec2((x as i32 * (EPS-2.0) as i32) as f32 + rand_thread.gen_range(0..10) as f32, (y * EPS as i32) as f32 + 20.0),
+                    velocity: glm::vec2(0.0, 0.0),
+                    forces: glm::vec2(0.0, 0.0),
+                    press_force: glm::vec2(0.0, 0.0),
+                    visc_force: glm::vec2(0.0, 0.0),
+                    pressure: 0.0,
+                    rho: 0.0,
+                };
+                num_placed += 1;
+            }
+        }
     }
+    println!("Num placed: {}", num_placed);
+
 
     let sdl2_ctx = sdl2::init().expect("Couldn't get SDL2 CTX");
     let sdl2_video = sdl2_ctx.video()
         .expect("Couldn't create video subsystem");
 
-    /*
-    let mut canvas = sdl2_video.window("SPH", 800, 600)
-        .build()
-        .expect("Couldn't build window!")
-        .into_canvas()
-        .software()
-        .build()
-        .expect("Couldn't build canvas from window!");
-*/
+
     let gl_attr = sdl2_video.gl_attr();
     gl_attr.set_context_profile(sdl2::video::GLProfile::Core);
     gl_attr.set_context_version(4, 6);
 
-    let sdl2_gl_window = sdl2_video.window("SPH-GL", 800, 600)
+    let sdl2_gl_window = sdl2_video.window("SPH-GL", 1600, 900)
         .opengl()
         .position_centered()
         .build()
@@ -163,7 +114,7 @@ fn main() {
 
     gl::load_with(|name| sdl2_video.gl_get_proc_address(name) as *const _);
 
-    let ogl_ctx = sdl2_gl_window.gl_create_context().expect("Couldn't create GL Context");
+    let _ogl_ctx = sdl2_gl_window.gl_create_context().expect("Couldn't create GL Context");
     //sdl2_gl_window.gl_set_context_to_current().expect("Couldn't make GL Context curr");
 
     let mut imgui = imgui::Context::create();
@@ -186,11 +137,38 @@ fn main() {
                                           String::from("fragment.glsl"));
     shader.use_shader();
 
+    let compute_clear = ogl::shader::Shader::new_compute(String::from("compute_clear.glsl"));
+
+    let compute_position = ogl::shader::Shader::new_compute(String::from("compute_position.glsl"));
+
+    let compute_density_clear = ogl::shader::Shader::new_compute(String::from("compute_density_clear.glsl"));
+
+    let compute_density_shader = ogl::shader::Shader::new_compute(String::from("compute_density.glsl"));
+
+    let compute_density_finish = ogl::shader::Shader::new_compute(String::from("compute_desnity_finish.glsl"));
+
+    let compute_force_clear = ogl::shader::Shader::new_compute(String::from("compute_force_clear.glsl"));
+
+    let compute_force = ogl::shader::Shader::new_compute(String::from("compute_force.glsl"));
+
+    let compute_force_finish = ogl::shader::Shader::new_compute(String::from("compute_force_finish.glsl"));
+
     let compute = ogl::shader::Shader::new_compute(String::from("compute.glsl"));
     compute.use_shader();
 
+    // Init UBO block
+    let param_ubo = Buffer::new();
+    //unsafe {
+    param_ubo.data(gl::UNIFORM_BUFFER,
+                   ptr::NonNull::new(&mut parameters)
+                       .expect("Couldn't new")
+                       .as_ptr()
+                       .cast(),
+                   std::mem::size_of::<PARAMS>());
+    //}
+    param_ubo.binding(gl::UNIFORM_BUFFER, 4);
 
-    let width_height = (800, 600);
+    let width_height = (1600, 900);
 
     let mut gl_img: gl::types::GLuint = 0;
     unsafe{
@@ -213,7 +191,7 @@ fn main() {
                        gl::RGBA, gl::FLOAT, std::ptr::null());
 
         gl::BindImageTexture(0, gl_img, 0, gl::FALSE, 0,
-                             gl::WRITE_ONLY, gl::RGBA32F);
+                             gl::READ_WRITE, gl::RGBA32F);
 
 
     }
@@ -223,60 +201,152 @@ fn main() {
     let timer = sdl2_ctx.timer().expect("Couldn't get timer");
 
     let mut last_time = timer.ticks();
+    let mut fps = 0;
+    let mut real_fps = 0;
 
     let sphere_buff = ogl::Buffer::new();
     sphere_buff.data(gl::SHADER_STORAGE_BUFFER, particles.as_ptr().cast(), std::mem::size_of::<Particle>() * num_particles);
     sphere_buff.binding(gl::SHADER_STORAGE_BUFFER, 2);
+
+    let mut mouse_pos: [i32;2] = [0;2];
     'mainLoop: loop{
         for event in event_pump.poll_iter(){
             match event{
                 sdl2::event::Event::Quit {..} => {break 'mainLoop;}
+                sdl2::event::Event::MouseMotion {x, y, ..} => {
+                    mouse_pos = [x,900 - y];
+                }
+                sdl2::event::Event::MouseButtonDown {mouse_btn, ..} => {
+                    match mouse_btn{
+                        MouseButton::Middle => {
+                            unsafe {
+                                gl::GetBufferSubData(gl::SHADER_STORAGE_BUFFER, 0, (std::mem::size_of::<Particle>() * num_particles) as gl::types::GLsizeiptr, particles.as_mut_ptr().cast());
+                            }
+                            num_placed = num_particles;
+                            num_particles += 100;
+                            for y in 1..(900/EPS as i32){
+                                for x in 1..((1600/6)/EPS as i32){
+                                    if num_placed < num_particles {
+                                        particles[num_placed] = Particle {
+                                            position: glm::vec2(((x * (EPS-2.0) as i32) + mouse_pos[0]) as f32 + rand_thread.gen_range(0..10) as f32,
+                                                                ((y * EPS as i32) + mouse_pos[1]) as f32 + 20.0),
+                                            velocity: glm::vec2(0.0, 0.0),
+                                            forces: glm::vec2(0.0, 0.0),
+                                            press_force: glm::vec2(0.0, 0.0),
+                                            visc_force: glm::vec2(0.0, 0.0),
+                                            pressure: 0.0,
+                                            rho: 0.0,
+                                        };
+                                        num_placed += 1;
+                                    }
+                                }
+                            }
+                            sphere_buff.data(gl::SHADER_STORAGE_BUFFER, particles.as_ptr().cast(), std::mem::size_of::<Particle>() * num_particles);
+                        }
+                        MouseButton::Right => {
+                            unsafe {
+                                gl::GetBufferSubData(gl::SHADER_STORAGE_BUFFER, 0, (std::mem::size_of::<Particle>() * num_particles) as gl::types::GLsizeiptr, particles.as_mut_ptr().cast());
+                            }
+                            num_particles -= 100;
+                            sphere_buff.data(gl::SHADER_STORAGE_BUFFER, particles.as_ptr().cast(), std::mem::size_of::<Particle>() * num_particles);
+                        }
+                        _ => {}
+                    }
+                }
                 _ => {}
             }
         }
 
-        compute_density(&mut particles, num_particles);
-        compute_forces(&mut particles, num_particles);
-        update_velocity_position(&mut particles, num_particles,  0.0007);
-        last_time = timer.ticks();
 
-        sphere_buff.update_data(gl::SHADER_STORAGE_BUFFER, particles.as_ptr().cast(), std::mem::size_of::<Particle>() * num_particles);
+        if !pause {
+            unsafe {
+                param_ubo.data(gl::UNIFORM_BUFFER,
+                               ptr::NonNull::new(&mut parameters)
+                                   .expect("Couldn't new")
+                                   .as_ptr()
+                                   .cast(),
+                               std::mem::size_of::<PARAMS>());
 
-        /*
-        canvas.set_draw_color(sdl2::pixels::Color::BLACK);
-        canvas.clear();
-        for p in 0..num_particles{
-            let position = particles[p].position;
-            canvas.set_draw_color(sdl2::pixels::Color::BLUE);
-            for x in PIXEL_MIN..=PIXEL_MAX {
-                for y in PIXEL_MIN..=PIXEL_MAX {
-                    if ( x.pow(2) + PIXEL_MAX) + (y.pow(2)+PIXEL_MAX) <= PIXEL_SIZE {
-                        canvas.draw_point(sdl2::rect::Point::new(position.x as i32 + x, position.y as i32 + y)).expect("Couldn't draw point");
-                    }
-                }
+                compute_density_clear.use_shader();
+                gl::DispatchCompute(num_particles as u32, 1, 1);
+
+                gl::MemoryBarrier(gl::SHADER_STORAGE_BARRIER_BIT);
+
+                compute_density_shader.use_shader();
+                gl::DispatchCompute(num_particles as u32, num_particles as u32, 1);
+
+                gl::MemoryBarrier(gl::SHADER_STORAGE_BARRIER_BIT);
+
+                compute_density_finish.use_shader();
+                gl::DispatchCompute(num_particles as u32, 1, 1);
+
+                compute_force_clear.use_shader();
+                gl::DispatchCompute(num_particles as u32, 1, 1);
+
+                gl::MemoryBarrier(gl::SHADER_STORAGE_BARRIER_BIT);
+
+                compute_force.use_shader();
+                gl::DispatchCompute(num_particles as u32, num_particles as u32, 1);
+
+                gl::MemoryBarrier(gl::SHADER_STORAGE_BARRIER_BIT);
+
+                compute_force_finish.use_shader();
+                gl::DispatchCompute(num_particles as u32, 1, 1);
+
+                gl::MemoryBarrier(gl::SHADER_STORAGE_BARRIER_BIT);
+                //update_velocity_position(&mut particles, num_particles,  0.0007);
+                //sphere_buff.update_data(gl::SHADER_STORAGE_BUFFER, particles.as_ptr().cast(), std::mem::size_of::<Particle>() * num_particles);
+                compute_position.use_shader();
+
+                //let initTime = timer.ticks();
+                gl::DispatchCompute(num_particles as u32, 1, 1);
+
+                gl::MemoryBarrier(gl::SHADER_STORAGE_BARRIER_BIT);
+                //gl::GetBufferSubData(gl::SHADER_STORAGE_BUFFER, 0, (std::mem::size_of::<Particle>() * num_particles) as gl::types::GLsizeiptr, particles.as_mut_ptr().cast());
+                //println!("Time: {}", timer.ticks() - initTime);
             }
         }
-        canvas.present();
-*/
 
-        compute.use_shader();
+
+
+        compute_clear.use_shader();
         unsafe{
-            gl::DispatchCompute(800,600,1);
+            gl::DispatchCompute(1600,900,1);
             gl::MemoryBarrier(gl::VERTEX_ATTRIB_ARRAY_BARRIER_BIT);
             gl::MemoryBarrier(gl::SHADER_IMAGE_ACCESS_BARRIER_BIT);
         }
+        compute.use_shader();
+        unsafe{
+            gl::DispatchCompute(num_particles as u32, 1, 1);
+            gl::MemoryBarrier(gl::VERTEX_ATTRIB_ARRAY_BARRIER_BIT);
+            gl::MemoryBarrier(gl::SHADER_IMAGE_ACCESS_BARRIER_BIT);
+        }
+
 
         shader.use_shader();
 
 
         imgui_sdl2.prepare_frame(imgui.io_mut(), &sdl2_gl_window, &event_pump.mouse_state());
 
-        let ui = imgui.frame();
+        let mut fps_out = String::from("FPS: ");
+        fps_out.push_str(real_fps
+            .to_string()
+            .as_str());
 
-        ui.window("Hello world")
-            .size([300.0, 100.0], Condition::FirstUseEver)
+        let ui = imgui.frame();
+        let mut str_out = String::from("Num Particles: ");
+        str_out.push_str(num_particles.to_string().as_str());
+
+        ui.window("Parameter editor")
+            .size([300.0, 200.0], Condition::FirstUseEver)
             .build(|| {
-                unsafe { ui.slider("Gas Const", 0.0, 3000.0, &mut GAS_CONST); }
+                ui.text(fps_out);
+                ui.text(str_out);
+                ui.checkbox("Paused: ",&mut pause);
+                ui.slider("Gas Const", 1.0, 3000.0, &mut parameters.gas_const);
+                ui.slider("Rest Density", 1.0, 3000.0, &mut parameters.rest_dens);
+                ui.slider("Mass", 1.0, 3000.0, &mut parameters.mass);
+                ui.slider("Visc", 1.0, 3000.0, &mut parameters.visc);
             });
         unsafe{
             gl::ClearColor(0.0, 0.0, 0.0, 1.0);
@@ -289,5 +359,13 @@ fn main() {
         imgui_sdl2.prepare_render(&ui, &sdl2_gl_window);
         renderer.render(&mut imgui);
         sdl2_gl_window.gl_swap_window();
+
+        if timer.ticks() - last_time > 1000{
+            real_fps = fps;
+            fps = 0;
+            last_time = timer.ticks();
+        } else{
+            fps += 1;
+        }
     }
 }
